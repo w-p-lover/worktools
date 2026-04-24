@@ -109,6 +109,15 @@ STRICT_HEADER_HINTS: Dict[str, List[str]] = {
     "marks_of_conformity": ["marksofconformity", "marksof", "conformity"],
 }
 
+STRICT_HEADER_FIELD_ORDER = [
+    "object_part_no",
+    "manufacturer_trademark",
+    "type_model",
+    "technical_data",
+    "standard",
+    "marks_of_conformity",
+]
+
 MARKED_TABLE_PATTERNS: Dict[str, List[str]] = {
     "components_information": [
         "tablecomponentsinformation",
@@ -445,6 +454,81 @@ def detect_components_header_mapping(df: pd.DataFrame) -> Optional[tuple[int, Di
     return best_start_row, best_mapping
 
 
+def header_cell_matches_field(norm: str, field: str) -> bool:
+    if not norm:
+        return False
+    if field == "object_part_no":
+        has_obj_part = ("object" in norm and "part" in norm) or "objectpart" in norm
+        has_no = "no" in norm or "number" in norm or norm.endswith("no")
+        return has_obj_part and has_no
+    if field == "manufacturer_trademark":
+        return ("manufacturer" in norm or "manufacture" in norm) and "trademark" in norm
+    if field == "type_model":
+        return ("type" in norm and "model" in norm) or "typemodel" in norm
+    if field == "technical_data":
+        return ("technical" in norm and "data" in norm) or "technicaldata" in norm
+    if field == "standard":
+        return "standard" in norm
+    if field == "marks_of_conformity":
+        has_marks = "mark" in norm
+        has_conf = "conformity" in norm or "conform" in norm
+        return (has_marks and has_conf) or "marksofconformity" in norm
+    return False
+
+
+def detect_components_header_template_mapping(df: pd.DataFrame) -> Optional[tuple[int, Dict[str, int]]]:
+    """
+    Very strict template detector for supplier style where table header is explicit.
+    Supported header families:
+    1) Object/part No. | Manufacturer/trademark | Type/model | Technical data | Standard | Mark(s) of conformity...
+    2) Item No. | Object/part no. | Manufacturer/Trademark | Type/Model | Technical Data | Standard | Mark(s)...
+    """
+    if df.empty:
+        return None
+
+    def find_ordered_mapping(row_values: List[str]) -> Optional[Dict[str, int]]:
+        norms = [normalize_for_match(v) for v in row_values]
+        mapping: Dict[str, int] = {}
+        prev = -1
+        for field in STRICT_HEADER_FIELD_ORDER:
+            found = None
+            for col_idx in range(prev + 1, len(norms)):
+                if header_cell_matches_field(norms[col_idx], field):
+                    found = col_idx
+                    break
+            if found is None:
+                return None
+            mapping[field] = found
+            prev = found
+
+        # Keep it sane: header columns should stay relatively compact.
+        span = mapping["marks_of_conformity"] - mapping["object_part_no"]
+        if span > 9:
+            return None
+        return mapping
+
+    best: Optional[tuple[int, Dict[str, int]]] = None
+    scan_rows = min(12, len(df))
+    for row_idx in range(scan_rows):
+        row_values = [normalize_cell(v) for v in df.iloc[row_idx].tolist()]
+        mapping = find_ordered_mapping(row_values)
+        if mapping is not None:
+            best = (row_idx + 1, mapping)
+            break
+
+        if row_idx + 1 < scan_rows:
+            next_row_values = [normalize_cell(v) for v in df.iloc[row_idx + 1].tolist()]
+            merged_values = []
+            for left, right in zip(row_values, next_row_values):
+                merged_values.append("\n".join([v for v in [left, right] if v]))
+            merged_mapping = find_ordered_mapping(merged_values)
+            if merged_mapping is not None:
+                best = (row_idx + 2, merged_mapping)
+                break
+
+    return best
+
+
 def candidate_normalized_text(candidate: TableCandidate) -> str:
     values = [normalize_cell(v) for v in candidate.df.to_numpy().flatten().tolist()]
     return normalize_for_match(" ".join(values))
@@ -555,6 +639,21 @@ def postprocess_marked_rows(rows: List[Dict[str, object]], kind: Optional[str] =
     """
     merged: List[Dict[str, object]] = []
 
+    def non_object_non_empty_count(row: Dict[str, object]) -> int:
+        return sum(1 for field in TARGET_FIELDS[1:] if normalize_cell(row.get(field, "")) != "")
+
+    def should_merge_into_previous(obj_raw: str, obj_norm: str, row: Dict[str, object]) -> bool:
+        # Empty object column is typically a wrapped continuation line.
+        if obj_raw.strip() == "":
+            return True
+        # "Alternative" as a standalone row can mean either:
+        # 1) a continuation marker (should merge), or
+        # 2) a full independent record (must stay separate).
+        # Only merge when the row is sparse enough to look like a marker/continuation.
+        if obj_norm in ("alternative", "(alternative)"):
+            return non_object_non_empty_count(row) <= 1
+        return False
+
     def merge_field(prev: Dict[str, object], field: str, value: str) -> None:
         if not value:
             return
@@ -571,7 +670,7 @@ def postprocess_marked_rows(rows: List[Dict[str, object]], kind: Optional[str] =
         obj_norm = normalize_for_match(obj_raw)
 
         if merged:
-            if obj_raw.strip() == "" or obj_norm in ("alternative", "(alternative)"):
+            if should_merge_into_previous(obj_raw, obj_norm, row):
                 prev = merged[-1]
                 # Preserve the alternative marker by appending to object name.
                 if obj_norm in ("alternative", "(alternative)"):
@@ -836,7 +935,9 @@ def extract_header_tracked_components_records(selected: List[TableCandidate]) ->
     best_rows: List[Dict[str, object]] = []
 
     for candidate in candidates:
-        header = detect_components_header_mapping(candidate.df)
+        header = detect_components_header_template_mapping(candidate.df)
+        if header is None:
+            header = detect_components_header_mapping(candidate.df)
         if header is None:
             continue
         start_row, mapping = header
@@ -872,7 +973,9 @@ def extract_header_tracked_components_records(selected: List[TableCandidate]) ->
         continuation_best_mapping: Optional[Dict[str, int]] = None
 
         for candidate in page_candidates:
-            header = detect_components_header_mapping(candidate.df)
+            header = detect_components_header_template_mapping(candidate.df)
+            if header is None:
+                header = detect_components_header_mapping(candidate.df)
             if header is not None:
                 start_row, mapping = header
                 score, rows = score_marked_table_candidate(
@@ -915,6 +1018,29 @@ def extract_header_tracked_components_records(selected: List[TableCandidate]) ->
         else:
             break
 
+    return records
+
+
+def extract_explicit_header_tables_records(selected: List[TableCandidate]) -> List[Dict[str, object]]:
+    """
+    Strict mode for supplier PDFs without TABLE: markers but with explicit
+    target header on each page/table. Only extract tables matching the known
+    6-column header templates.
+    """
+    records: List[Dict[str, object]] = []
+    for candidate in sorted(selected, key=lambda c: (c.page, c.index_on_page)):
+        header = detect_components_header_template_mapping(candidate.df)
+        if header is None:
+            continue
+        start_row, mapping = header
+        _, rows = score_marked_table_candidate(
+            candidate,
+            mapping,
+            start_row=start_row,
+            kind_override="components_information",
+        )
+        if rows:
+            records.extend(rows)
     return records
 
 
@@ -1196,7 +1322,12 @@ def extract_target_records(
         if marked_records:
             return pd.DataFrame(marked_records, columns=TARGET_OUTPUT_COLUMNS)
 
-        # Phase 2: strict header tracking for suppliers without TABLE: markers.
+        # Phase 2: strict template headers (for PDFs that repeat explicit header each page).
+        strict_template_records = deduplicate_target_records(extract_explicit_header_tables_records(selected))
+        if strict_template_records:
+            return pd.DataFrame(strict_template_records, columns=TARGET_OUTPUT_COLUMNS)
+
+        # Phase 3: strict header tracking fallback (for one-header + continuation pages).
         header_tracked = deduplicate_target_records(extract_header_tracked_components_records(selected))
         if header_tracked:
             return pd.DataFrame(header_tracked, columns=TARGET_OUTPUT_COLUMNS)
