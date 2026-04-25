@@ -18,6 +18,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import ssl
 import sys
 import uuid
@@ -29,6 +30,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_MODEL = os.getenv("IMAGE_API_MODEL", "gpt-image-2")
 DEFAULT_OUTPUT_DIR = Path.cwd() / "image_api_outputs"
+DEFAULT_TIMEOUT = int(os.getenv("IMAGE_API_TIMEOUT", "600"))
 
 
 def load_dotenv_if_exists() -> None:
@@ -80,6 +82,7 @@ def request_json(
     headers: Dict[str, str],
     data: bytes,
     insecure: bool = False,
+    timeout_seconds: int = DEFAULT_TIMEOUT,
 ) -> dict:
     parsed = urlsplit(url)
     path = parsed.path or "/"
@@ -91,14 +94,14 @@ def request_json(
         connection = http.client.HTTPSConnection(
             parsed.hostname,
             parsed.port or 443,
-            timeout=120,
+            timeout=timeout_seconds,
             context=context,
         )
     elif parsed.scheme == "http":
         connection = http.client.HTTPConnection(
             parsed.hostname,
             parsed.port or 80,
-            timeout=120,
+            timeout=timeout_seconds,
         )
     else:
         fail(f"不支持的协议: {parsed.scheme}")
@@ -110,6 +113,8 @@ def request_json(
         body = response.read().decode("utf-8", errors="replace")
     except ssl.SSLError as exc:
         fail(f"HTTPS 证书校验失败: {exc}。如果是内网自签名证书，可以追加 --insecure")
+    except socket.timeout:
+        fail(f"请求超时，已等待 {timeout_seconds} 秒。可以追加 --timeout 提高超时时间，例如 --timeout 900")
     except OSError as exc:
         fail(f"请求失败，网络错误: {exc}")
     finally:
@@ -202,6 +207,7 @@ def handle_generate(args: argparse.Namespace) -> None:
         },
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         insecure=args.insecure,
+        timeout_seconds=args.timeout,
     )
 
     data_item = (response.get("data") or [{}])[0]
@@ -238,6 +244,7 @@ def handle_edit(args: argparse.Namespace) -> None:
         },
         data=body,
         insecure=args.insecure,
+        timeout_seconds=args.timeout,
     )
 
     data_item = (response.get("data") or [{}])[0]
@@ -281,6 +288,7 @@ def handle_chat_edit(args: argparse.Namespace) -> None:
         },
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         insecure=args.insecure,
+        timeout_seconds=args.timeout,
     )
 
     choices = response.get("choices") or []
@@ -309,6 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--insecure",
             action="store_true",
             help="跳过 HTTPS 证书校验，适用于内网自签名证书场景",
+        )
+        subparser.add_argument(
+            "--timeout",
+            type=int,
+            default=DEFAULT_TIMEOUT,
+            help=f"请求超时时间，单位秒，默认 {DEFAULT_TIMEOUT}",
         )
         subparser.add_argument(
             "--output-dir",

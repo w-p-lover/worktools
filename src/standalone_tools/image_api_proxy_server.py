@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse
 
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
-UPSTREAM_IMAGE_MODEL = os.getenv("UPSTREAM_IMAGE_MODEL", "gpt-image-1.5")
+UPSTREAM_IMAGE_MODEL = os.getenv("UPSTREAM_IMAGE_MODEL", "gpt-image-2")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LOCAL_API_KEY = os.getenv("LOCAL_API_KEY", "")
 

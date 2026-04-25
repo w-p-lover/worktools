@@ -42,6 +42,12 @@ IMAGE_API_MODEL=gpt-image-2
 - `IMAGE_API_KEY` 填你自己的接口 key
 - `IMAGE_API_MODEL` 按文档使用 `gpt-image-2`
 
+启动服务器端：
+
+```env
+uvicorn src.standalone_tools.image_api_proxy_server:app --host 0.0.0.0 --port 8000 
+```
+
 ## 2. 客户端脚本位置
 
 脚本路径：

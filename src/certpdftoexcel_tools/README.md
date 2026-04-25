@@ -1,51 +1,178 @@
-# PDF 转 Excel（复杂单元格增强版）
+certpdftoexcel_tools
 
-## 1) 安装依赖
+用于认证报告的PDF转Excel提取工具。
+
+本文件夹记录了以 `pdf_to_excel_precise.py` 为核心的当前工作流程。
+
+## 目标
+
+从供应商PDF中仅提取目标6列表格，同时保留复杂的多行单元格内容。
+
+目标字段：
+
+1. `Object / part No.`（物件/零件号）
+2. `Manufacturer / trademark`（制造商/商标）
+3. `Type / model`（类型/型号）
+4. `Technical data`（技术参数）
+5. `Standard`（标准）
+6. `Mark(s) of conformity`（符合性标志）（及文件编号变体）
+
+## 提取策略（当前版本）
+
+该脚本采用分阶段策略：
+
+### 1. 基于「TABLE:」标记的聚焦提取
+
+适用于包含以下标记的PDF：
+
+- `TABLE: Components information`（表格：组件信息）
+- `TABLE: list of compressor`（表格：压缩机清单）
+
+仅提取该标记后续的目标表格。
+
+若仅第一页包含表头，后续无表头的延续页面仍会被跟踪，直至下一个表格边界。
+
+### 2. 严格表头模板提取（无「TABLE:」标记场景）
+
+适用于每一页均重复显式表头的供应商PDF。
+
+脚本优先匹配已知的目标表头类型，减少无关表格的捕获。
+
+### 3. 降级策略：严格表头映射+延续跟踪
+
+若严格模板匹配未提取到行数据，将降级为「严格表头映射+延续逻辑」进行提取。
+
+### 4. 宽模式（可选）
+
+通用的跨供应商6列扫描模式。
+
+召回率更高，但可能包含更多非目标行。
+
+## 命令行（CLI）使用方法
+
+### 1) 聚焦模式（推荐）
+
+用于生产环境导出（精度最优）：
 
 ```powershell
-pip install -r requirements.txt
+python "C:\Users\IT074\Documents\New project\pdf_to_excel_precise.py" `
+  "C:\path\to\input.pdf" `
+  "C:\path\to\output.xlsx" `
+  --target-only --pages all --engine pdfplumber --target-policy focused --min-score 4
 ```
 
-> Windows 下 `camelot` 可能还需要 Ghostscript。若报错请安装 Ghostscript 并加入 PATH。
+说明：
 
-## 2) 运行
+- `--target-only`：仅导出目标6列数据行。
+- `--target-policy focused`：启用分阶段精确提取逻辑。
+- `--engine pdfplumber`：推荐作为此类报告的默认解析引擎。
+
+### 2) 宽模式（当聚焦模式遗漏过多数据时使用）
 
 ```powershell
-python pdf_to_excel_precise.py "你的输入.pdf" "输出.xlsx"
+python "C:\Users\IT074\Documents\New project\pdf_to_excel_precise.py" `
+  "C:\path\to\input.pdf" `
+  "C:\path\to\output.xlsx" `
+  --target-only --pages all --engine pdfplumber --target-policy broad --min-score 4
 ```
 
-可选参数：
+仅当聚焦模式遗漏过多数据时，才使用宽模式。
+
+### 3) 解析所有表格（仅用于调试）
 
 ```powershell
-python pdf_to_excel_precise.py "in.pdf" "out.xlsx" --pages 1-10 --engine pdfplumber --min-score 8
-python pdf_to_excel_precise.py "in.pdf" "out.xlsx" --target-only --engine pdfplumber
+python "C:\Users\IT074\Documents\New project\pdf_to_excel_precise.py" `
+  "C:\path\to\input.pdf" `
+  "C:\path\to\output_all_tables.xlsx" `
+  --pages all --engine pdfplumber
 ```
 
-参数说明：
-- `--pages`：`all`、`1`、`1,3,5`、`2-8`、`1,3-5`
-- `--engine`：`pdfplumber`（默认，推荐）、`camelot`、`all`
-- `--flavor`：`lattice`（有边框表格更强）、`stream`（无边框更强）、`both`（仅在 `--engine camelot/all` 时生效）
-- `--min-score`：过滤低质量识别结果，默认 `8`
-- `--target-only`：仅导出目标六列（`Object/part no` 到 `Mark(s) of Conformity`）
-- `--target-policy`：`focused`（默认，只跟随一张目标表，直到下一个 `TABLE:` 标记结束），`broad`（保留所有匹配到的六列结果）
+此命令会导出多个工作表，主要用于问题诊断。
 
-## 3) 输出说明
+## 批量转换（文件夹→文件夹）
 
-Excel 中会有：
-- 多个表格 sheet：每个检测到的表格一个 sheet
-- `SUMMARY` sheet：记录每个表格来源页码、引擎、评分等
+```powershell
+$script = "C:\Users\IT074\Documents\New project\pdf_to_excel_precise.py"
+$inDir  = "C:\Users\IT074\Desktop\测试PDF"
+$outDir = "C:\Users\IT074\Desktop\测试PDF输出"
 
-脚本会尽量保留单元格内换行，并自动设置换行显示与行高。
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-如果使用 `--target-only`，Excel 仅输出一个 `TARGET_6_ITEMS` sheet，
-并支持“前面表有表头，后续表只有数据行”的场景（会沿用先前识别到的列映射）。
-`--target-only` 采用两阶段策略：若 PDF 中存在 `TABLE: Components information`、`TABLE: list of compressor` 之类的明确表格标记，则优先沿着这张主表跨页提取；若未命中，再回退到宽松跨供应商六列表头规则。
-当 `--target-only` 且 `--engine pdfplumber` 未命中时，脚本会自动回退到 `engine=all` 再尝试一次（兼容更多供应商版式）。
-若回退后仍未命中，不会抛异常中断批处理，而是输出空的 `TARGET_6_ITEMS` sheet（0 行）。
+Get-ChildItem -Path $inDir -Filter *.pdf -File | ForEach-Object {
+    $outFile = Join-Path $outDir ($_.BaseName + ".xlsx")
+    python $script $_.FullName $outFile --target-only --pages all --engine pdfplumber --target-policy focused --min-score 4
+}
+```
 
-## 4) 精度建议（接近 WPS 效果）
+## 推荐参数配置
 
-- PDF 为矢量文本时效果最好（不是扫描图片）
-- 表格线清晰时优先 `lattice`
-- 无边框或弱边框可尝试 `stream`
-- 若是扫描件，请先 OCR 再转换
+- 默认配置：
+  - `--target-only`
+  - `--pages all`
+  - `--engine pdfplumber`
+  - `--target-policy focused`
+  - `--min-score 4`
+- 若聚焦模式返回数据过少：
+  - 保持聚焦模式，降低阈值（例如 `--min-score 3`）。
+  - 若仍无法满足需求，切换至 `--target-policy broad`（宽模式）。
+
+## 常见问题
+
+### 问题1：在一个环境中仅导出少量行，另一个环境却导出大量行
+
+可能原因：
+
+- 不同的Python环境（虚拟环境 `.venv` 与系统Python）可能导致数据框（dataframe）空单元格行为不一致。
+
+当前处理方式：
+
+- 将类空值（`None`、`NaN`、`pd.NA`）标准化为空字符串，以稳定列映射。
+
+### 问题2：TABLE模式下，行数据被意外合并
+
+当前处理方式：
+
+- 后续合并逻辑受到限制：        
+  - 物件（object）单元格为空的行，将被视为换行延续内容，可能会被合并。
+  - 包含「Alternative」（替代项）的行，仅当该行数据稀疏（类似标记）时才会合并，独立完整的记录行不会被合并。
+
+### 问题3：无TABLE标记的PDF中，导出过多无关行
+
+建议：
+
+- 使用 `--target-policy focused`（聚焦模式），确保先应用严格表头模板提取，再执行宽模式降级。
+
+## 输出格式
+
+目标输出工作表包含以下列：
+
+- `page`（页码）
+- `table_index_on_page`（页面内表格索引）
+- `row_index_on_table`（表格内行索引）
+- `engine`（解析引擎）
+- `object_part_no`（物件/零件号）
+- `manufacturer_trademark`（制造商/商标）
+- `type_model`（类型/型号）
+- `technical_data`（技术参数）
+- `standard`（标准）
+- `marks_of_conformity`（符合性标志）
+
+## 快速验证清单
+
+每次运行后，请执行以下验证：
+
+1. 确认控制台输出行：`Done. Saved N target row(s) ...`（完成。已保存N行目标数据...）
+2. 验证输出结果中的起始页码和结束页码是否正确。
+3. 抽样检查：        
+   1. 前3行数据
+   2. 页面边界处的行数据
+   3. 包含「Alternative」的行数据
+4. 若结果存在大量无关数据，重新使用聚焦模式运行。
+
+## 文件位置
+
+当前文档路径：
+
+```
+C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\README.md
+```
