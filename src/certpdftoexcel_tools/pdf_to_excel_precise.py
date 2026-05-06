@@ -130,6 +130,12 @@ MARKED_TABLE_PATTERNS: Dict[str, List[str]] = {
     ],
 }
 
+ENABLE_SUPERSCRIPT_FIX = False
+SUPERSCRIPT_MAP = {"2": "²", "3": "³"}
+AREA_VOLUME_UNIT_RE = re.compile(
+    r"(?i)\b(mm|cm|dm|m|km|in|ft|yd)\s*(?:\^|\*\*)?\s*([23])\b"
+)
+
 
 @dataclass
 class TableCandidate:
@@ -162,11 +168,30 @@ def normalize_cell(value: object) -> str:
     # Keep line breaks, but normalize extra spaces in each line.
     lines = [MULTISPACE_RE.sub(" ", line).strip() for line in text.split("\n")]
     # Preserve intentional empty lines inside a cell.
-    return "\n".join(lines).strip()
+    normalized = "\n".join(lines).strip()
+    if ENABLE_SUPERSCRIPT_FIX:
+        normalized = restore_superscript_units(normalized)
+    return normalized
 
 
 def normalize_for_match(text: str) -> str:
     return MATCH_NORMALIZE_RE.sub("", text.lower())
+
+
+def restore_superscript_units(text: str) -> str:
+    """
+    Heuristic recovery for cases where superscript ²/³ is extracted as plain 2/3.
+    Only targets common area/volume unit forms to avoid corrupting model numbers.
+    """
+    if text == "":
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        unit = match.group(1)
+        power = match.group(2)
+        return f"{unit}{SUPERSCRIPT_MAP.get(power, power)}"
+
+    return AREA_VOLUME_UNIT_RE.sub(repl, text)
 
 
 def split_label_value(text: str) -> tuple[str, str]:
@@ -1275,6 +1300,7 @@ def select_candidates(
     flavor: str,
     engine: str,
     min_score: float,
+    dedup: bool = True,
 ) -> tuple[List[TableCandidate], List[TableCandidate]]:
     all_candidates: List[TableCandidate] = []
 
@@ -1292,7 +1318,9 @@ def select_candidates(
             "If PDF is scanned, run OCR first; or try a page range with clear table lines."
         )
 
-    selected = deduplicate_candidates(all_candidates)
+    selected = deduplicate_candidates(all_candidates) if dedup else sorted(
+        all_candidates, key=lambda x: (x.page, x.index_on_page, -x.score)
+    )
     selected = [c for c in selected if c.score >= min_score and not c.df.empty]
     return all_candidates, selected
 
@@ -1304,6 +1332,7 @@ def extract_target_records(
     engine: str,
     min_score: float,
     target_policy: str = "focused",
+    dedup: bool = True,
 ) -> pd.DataFrame:
     _, selected = select_candidates(
         input_pdf=input_pdf,
@@ -1311,6 +1340,7 @@ def extract_target_records(
         flavor=flavor,
         engine=engine,
         min_score=min_score,
+        dedup=dedup,
     )
 
     if target_policy not in ("focused", "broad"):
@@ -1318,17 +1348,23 @@ def extract_target_records(
 
     if target_policy == "focused":
         # Phase 1: if the PDF explicitly labels the target table, follow that table first.
-        marked_records = deduplicate_target_records(extract_marked_table_records(selected))
+        marked_records = extract_marked_table_records(selected)
+        if dedup:
+            marked_records = deduplicate_target_records(marked_records)
         if marked_records:
             return pd.DataFrame(marked_records, columns=TARGET_OUTPUT_COLUMNS)
 
         # Phase 2: strict template headers (for PDFs that repeat explicit header each page).
-        strict_template_records = deduplicate_target_records(extract_explicit_header_tables_records(selected))
+        strict_template_records = extract_explicit_header_tables_records(selected)
+        if dedup:
+            strict_template_records = deduplicate_target_records(strict_template_records)
         if strict_template_records:
             return pd.DataFrame(strict_template_records, columns=TARGET_OUTPUT_COLUMNS)
 
         # Phase 3: strict header tracking fallback (for one-header + continuation pages).
-        header_tracked = deduplicate_target_records(extract_header_tracked_components_records(selected))
+        header_tracked = extract_header_tracked_components_records(selected)
+        if dedup:
+            header_tracked = deduplicate_target_records(header_tracked)
         if header_tracked:
             return pd.DataFrame(header_tracked, columns=TARGET_OUTPUT_COLUMNS)
 
@@ -1348,7 +1384,7 @@ def extract_target_records(
             )
         )
 
-    records = deduplicate_target_records(all_records)
+    records = deduplicate_target_records(all_records) if dedup else all_records
     if not records:
         raise RuntimeError(
             "No target rows found. Try lowering --min-score (e.g. 5) or run --engine all for comparison."
@@ -1492,11 +1528,23 @@ def parse_args() -> argparse.Namespace:
         default="focused",
         help="Target extraction policy: focused follows a single table (until next TABLE:); broad keeps all matches",
     )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Disable all deduplication (both candidate-level and target-row-level)",
+    )
+    parser.add_argument(
+        "--fix-superscript",
+        action="store_true",
+        help="Recover common unit superscripts (m2/mm2/cm2/m3 -> m²/mm²/cm²/m³)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global ENABLE_SUPERSCRIPT_FIX
     args = parse_args()
+    ENABLE_SUPERSCRIPT_FIX = args.fix_superscript
     if args.target_only:
         target_df: Optional[pd.DataFrame] = None
         try:
@@ -1507,6 +1555,7 @@ def main() -> None:
                 engine=args.engine,
                 min_score=args.min_score,
                 target_policy=args.target_policy,
+                dedup=not args.no_dedup,
             )
         except RuntimeError as exc:
             # Mixed supplier PDFs may need camelot fallback for key-value alternative blocks.
@@ -1523,6 +1572,7 @@ def main() -> None:
                         engine="all",
                         min_score=args.min_score,
                         target_policy=args.target_policy,
+                        dedup=not args.no_dedup,
                     )
                 except RuntimeError:
                     print(
