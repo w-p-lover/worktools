@@ -25,12 +25,12 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
-DEFAULT_MODEL = os.getenv("IMAGE_API_MODEL", "gpt-image-2")
+DEFAULT_MODEL = "gpt-image-2-vip"
 DEFAULT_OUTPUT_DIR = Path.cwd() / "image_api_outputs"
-DEFAULT_TIMEOUT = int(os.getenv("IMAGE_API_TIMEOUT", "600"))
+DEFAULT_TIMEOUT = 600
 
 
 def load_dotenv_if_exists() -> None:
@@ -53,6 +53,18 @@ def fail(message: str, exit_code: int = 1) -> None:
     raise SystemExit(exit_code)
 
 
+def build_http_error_message(status: int, body: str) -> str:
+    message = f"请求失败，状态码 {status}，响应内容: {body}"
+    if status == 524:
+        message += (
+            "\n说明: 524 通常表示请求已经到达接口网关，但后端生成图片耗时过长，"
+            "网关等不到结果而超时。提高本地 --timeout 通常不能解决这个错误。"
+            "\n建议: 先用更短提示词或较小尺寸测试，例如追加 --size 1024x1024；"
+            "如果仍然 524，需要等待 Right Code 后端恢复或联系服务方。"
+        )
+    return message
+
+
 def ensure_base_url(value: Optional[str]) -> str:
     base_url = value or os.getenv("IMAGE_API_BASE_URL")
     if not base_url:
@@ -65,6 +77,20 @@ def ensure_api_key(value: Optional[str]) -> str:
     if not api_key:
         fail("缺少 API key，请通过 --api-key 或 .env/环境变量 IMAGE_API_KEY 提供")
     return api_key
+
+
+def resolve_prompt(args: argparse.Namespace) -> str:
+    if args.prompt_file:
+        prompt_path = Path(args.prompt_file).expanduser().resolve()
+        if not prompt_path.exists():
+            fail(f"提示词文件不存在: {prompt_path}")
+        prompt = prompt_path.read_text(encoding="utf-8-sig")
+    else:
+        prompt = args.prompt
+
+    if not prompt or not prompt.strip():
+        fail("提示词不能为空")
+    return prompt
 
 
 def ensure_image(path_value: Optional[str]) -> Path:
@@ -121,13 +147,62 @@ def request_json(
         connection.close()
 
     if status < 200 or status >= 300:
-        fail(f"请求失败，状态码 {status}，响应内容: {body}")
+        fail(build_http_error_message(status, body))
 
     try:
         return json.loads(body)
     except json.JSONDecodeError:
         fail(f"接口返回不是合法 JSON: {body}")
     return {}
+
+
+def request_bytes(
+    url: str,
+    insecure: bool = False,
+    timeout_seconds: int = DEFAULT_TIMEOUT,
+) -> tuple[bytes, str]:
+    parsed = urlsplit(url)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        context = ssl._create_unverified_context() if insecure else None
+        connection = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 443,
+            timeout=timeout_seconds,
+            context=context,
+        )
+    elif parsed.scheme == "http":
+        connection = http.client.HTTPConnection(
+            parsed.hostname,
+            parsed.port or 80,
+            timeout=timeout_seconds,
+        )
+    else:
+        fail(f"不支持的图片 URL 协议: {parsed.scheme}")
+
+    try:
+        connection.request(method="GET", url=path)
+        response = connection.getresponse()
+        status = response.status
+        content_type = response.getheader("Content-Type", "")
+        body = response.read()
+    except ssl.SSLError as exc:
+        fail(f"下载图片时 HTTPS 证书校验失败: {exc}。如果是内网自签名证书，可以追加 --insecure")
+    except socket.timeout:
+        fail(f"下载图片超时，已等待 {timeout_seconds} 秒。可以追加 --timeout 提高超时时间")
+    except OSError as exc:
+        fail(f"下载图片失败，网络错误: {exc}")
+    finally:
+        connection.close()
+
+    if status < 200 or status >= 300:
+        body_text = body.decode("utf-8", errors="replace")
+        fail(build_http_error_message(status, body_text))
+
+    return body, content_type
 
 
 def guess_extension_from_base64(image_b64: str) -> str:
@@ -138,9 +213,21 @@ def guess_extension_from_base64(image_b64: str) -> str:
     return ".png"
 
 
-def build_output_path(output_dir: Path, filename: Optional[str], image_b64: str) -> Path:
+def guess_extension_from_content_type(content_type: str) -> str:
+    mime_type = content_type.split(";", 1)[0].strip().lower()
+    return mimetypes.guess_extension(mime_type) or ".png"
+
+
+def guess_extension_from_url(image_url: str) -> str:
+    suffix = Path(unquote(urlsplit(image_url).path)).suffix
+    if suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        return suffix
+    return ".png"
+
+
+def build_output_path(output_dir: Path, filename: Optional[str], extension: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    ext = guess_extension_from_base64(image_b64)
+    ext = extension if extension.startswith(".") else f".{extension}"
     if filename:
         name = filename if Path(filename).suffix else f"{filename}{ext}"
     else:
@@ -150,9 +237,52 @@ def build_output_path(output_dir: Path, filename: Optional[str], image_b64: str)
 
 
 def save_base64_image(image_b64: str, output_dir: Path, filename: Optional[str]) -> Path:
-    output_path = build_output_path(output_dir, filename, image_b64)
+    output_path = build_output_path(output_dir, filename, guess_extension_from_base64(image_b64))
     output_path.write_bytes(base64.b64decode(image_b64))
     return output_path
+
+
+def save_url_image(
+    image_url: str,
+    output_dir: Path,
+    filename: Optional[str],
+    insecure: bool = False,
+    timeout_seconds: int = DEFAULT_TIMEOUT,
+) -> Path:
+    image_bytes, content_type = request_bytes(
+        image_url,
+        insecure=insecure,
+        timeout_seconds=timeout_seconds,
+    )
+    extension = guess_extension_from_content_type(content_type) if content_type else guess_extension_from_url(image_url)
+    output_path = build_output_path(output_dir, filename, extension)
+    output_path.write_bytes(image_bytes)
+    return output_path
+
+
+def save_image_item(
+    data_item: Dict[str, object],
+    output_dir: Path,
+    filename: Optional[str],
+    insecure: bool = False,
+    timeout_seconds: int = DEFAULT_TIMEOUT,
+) -> Path:
+    image_b64 = data_item.get("b64_json")
+    if isinstance(image_b64, str) and image_b64:
+        return save_base64_image(image_b64, output_dir, filename)
+
+    image_url = data_item.get("url")
+    if isinstance(image_url, str) and image_url:
+        return save_url_image(
+            image_url,
+            output_dir,
+            filename,
+            insecure=insecure,
+            timeout_seconds=timeout_seconds,
+        )
+
+    fail(f"响应中未找到 data[0].b64_json 或 data[0].url: {json.dumps(data_item, ensure_ascii=False)}")
+    raise AssertionError("unreachable")
 
 
 def extract_markdown_data_image(content: str) -> Optional[str]:
@@ -190,13 +320,33 @@ def build_multipart_form_data(fields: Dict[str, str], file_field: str, file_path
     return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
 
 
+def build_optional_image_fields(args: argparse.Namespace) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for name in ("size", "quality"):
+        value = getattr(args, name, None)
+        if value:
+            fields[name] = str(value)
+
+    n = getattr(args, "n", None)
+    if n is not None:
+        fields["n"] = str(n)
+    return fields
+
+
+def add_optional_image_fields(payload: Dict[str, object], args: argparse.Namespace) -> None:
+    for key, value in build_optional_image_fields(args).items():
+        payload[key] = int(value) if key == "n" else value
+
+
 def handle_generate(args: argparse.Namespace) -> None:
     base_url = ensure_base_url(args.base_url)
     api_key = ensure_api_key(args.api_key)
+    prompt = resolve_prompt(args)
     payload = {
         "model": args.model,
-        "prompt": args.prompt,
+        "prompt": prompt,
     }
+    add_optional_image_fields(payload, args)
 
     response = request_json(
         url=f"{base_url}/v1/images/generations",
@@ -211,11 +361,13 @@ def handle_generate(args: argparse.Namespace) -> None:
     )
 
     data_item = (response.get("data") or [{}])[0]
-    image_b64 = data_item.get("b64_json")
-    if not image_b64:
-        fail(f"响应中未找到 data[0].b64_json: {json.dumps(response, ensure_ascii=False)}")
-
-    output_path = save_base64_image(image_b64, Path(args.output_dir), args.filename)
+    output_path = save_image_item(
+        data_item,
+        Path(args.output_dir),
+        args.filename,
+        insecure=args.insecure,
+        timeout_seconds=args.timeout,
+    )
     print(f"图片已保存: {output_path}")
     if data_item.get("revised_prompt"):
         print(f"revised_prompt: {data_item['revised_prompt']}")
@@ -224,12 +376,14 @@ def handle_generate(args: argparse.Namespace) -> None:
 def handle_edit(args: argparse.Namespace) -> None:
     base_url = ensure_base_url(args.base_url)
     api_key = ensure_api_key(args.api_key)
+    prompt = resolve_prompt(args)
     image_path = ensure_image(args.image)
 
     content_type, body = build_multipart_form_data(
         fields={
             "model": args.model,
-            "prompt": args.prompt,
+            "prompt": prompt,
+            **build_optional_image_fields(args),
         },
         file_field="image",
         file_path=image_path,
@@ -248,11 +402,13 @@ def handle_edit(args: argparse.Namespace) -> None:
     )
 
     data_item = (response.get("data") or [{}])[0]
-    image_b64 = data_item.get("b64_json")
-    if not image_b64:
-        fail(f"响应中未找到 data[0].b64_json: {json.dumps(response, ensure_ascii=False)}")
-
-    output_path = save_base64_image(image_b64, Path(args.output_dir), args.filename)
+    output_path = save_image_item(
+        data_item,
+        Path(args.output_dir),
+        args.filename,
+        insecure=args.insecure,
+        timeout_seconds=args.timeout,
+    )
     print(f"图片已保存: {output_path}")
     if data_item.get("revised_prompt"):
         print(f"revised_prompt: {data_item['revised_prompt']}")
@@ -261,6 +417,7 @@ def handle_edit(args: argparse.Namespace) -> None:
 def handle_chat_edit(args: argparse.Namespace) -> None:
     base_url = ensure_base_url(args.base_url)
     api_key = ensure_api_key(args.api_key)
+    prompt = resolve_prompt(args)
     image_path = ensure_image(args.image)
     mime_type = get_image_mime_type(image_path)
     image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
@@ -269,7 +426,7 @@ def handle_chat_edit(args: argparse.Namespace) -> None:
         "model": args.model,
         "role": "user",
         "content": [
-            {"type": "text", "text": args.prompt},
+            {"type": "text", "text": prompt},
             {
                 "type": "image_url",
                 "image_url": {
@@ -303,6 +460,9 @@ def handle_chat_edit(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_model = os.getenv("IMAGE_API_MODEL", DEFAULT_MODEL)
+    default_timeout = int(os.getenv("IMAGE_API_TIMEOUT", str(DEFAULT_TIMEOUT)))
+
     parser = argparse.ArgumentParser(
         description="独立的图片接口调用工具，不影响现有项目文件。",
     )
@@ -311,8 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common_arguments(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--base-url", help="接口基础地址，例如 https://api.example.com")
         subparser.add_argument("--api-key", help="接口密钥，不传则读取 IMAGE_API_KEY")
-        subparser.add_argument("--model", default=DEFAULT_MODEL, help=f"模型名，默认 {DEFAULT_MODEL}")
-        subparser.add_argument("--prompt", required=True, help="提示词")
+        subparser.add_argument("--model", default=default_model, help=f"模型名，默认 {default_model}")
+        prompt_group = subparser.add_mutually_exclusive_group(required=True)
+        prompt_group.add_argument("--prompt", help="提示词")
+        prompt_group.add_argument("--prompt-file", help="从 UTF-8 文本文件读取提示词，适合多行长提示词")
         subparser.add_argument(
             "--insecure",
             action="store_true",
@@ -321,8 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--timeout",
             type=int,
-            default=DEFAULT_TIMEOUT,
-            help=f"请求超时时间，单位秒，默认 {DEFAULT_TIMEOUT}",
+            default=default_timeout,
+            help=f"请求超时时间，单位秒，默认 {default_timeout}",
         )
         subparser.add_argument(
             "--output-dir",
@@ -330,6 +492,9 @@ def build_parser() -> argparse.ArgumentParser:
             help=f"输出目录，默认 {DEFAULT_OUTPUT_DIR}",
         )
         subparser.add_argument("--filename", help="输出文件名，可不带后缀")
+        subparser.add_argument("--size", help="图片尺寸，例如 1024x1024")
+        subparser.add_argument("--quality", help="图片质量，例如 low、medium、high")
+        subparser.add_argument("--n", type=int, help="生成图片数量")
 
     parser_generate = subparsers.add_parser("generate", help="调用 /v1/images/generations")
     add_common_arguments(parser_generate)

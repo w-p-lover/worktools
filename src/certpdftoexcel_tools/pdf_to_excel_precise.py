@@ -131,10 +131,12 @@ MARKED_TABLE_PATTERNS: Dict[str, List[str]] = {
 }
 
 ENABLE_SUPERSCRIPT_FIX = False
+FLATTEN_CELL_NEWLINES = False
 SUPERSCRIPT_MAP = {"2": "²", "3": "³"}
 AREA_VOLUME_UNIT_RE = re.compile(
     r"(?i)\b(mm|cm|dm|m|km|in|ft|yd)\s*(?:\^|\*\*)?\s*([23])\b"
 )
+TECH_AREA_UNIT_RE = re.compile(r"(?<![A-Za-z])(mm|cm|dm|m|km)\s*(?:\^|\*\*)?\s*2\b")
 
 
 @dataclass
@@ -165,10 +167,14 @@ def normalize_cell(value: object) -> str:
         # Some objects don't play well with pd.isna (e.g., lists); fall back.
         return ""
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    # Keep line breaks, but normalize extra spaces in each line.
+    # Normalize extra spaces in each line.
     lines = [MULTISPACE_RE.sub(" ", line).strip() for line in text.split("\n")]
-    # Preserve intentional empty lines inside a cell.
-    normalized = "\n".join(lines).strip()
+    if FLATTEN_CELL_NEWLINES:
+        # Replace intra-cell line breaks with spaces.
+        normalized = " ".join([line for line in lines if line != ""]).strip()
+    else:
+        # Preserve intentional empty lines inside a cell.
+        normalized = "\n".join(lines).strip()
     if ENABLE_SUPERSCRIPT_FIX:
         normalized = restore_superscript_units(normalized)
     return normalized
@@ -192,6 +198,21 @@ def restore_superscript_units(text: str) -> str:
         return f"{unit}{SUPERSCRIPT_MAP.get(power, power)}"
 
     return AREA_VOLUME_UNIT_RE.sub(repl, text)
+
+
+def normalize_technical_data_text(text: str) -> str:
+    """
+    Field-specific normalization for technical_data:
+    force mm2/cm2/dm2/m2/km2 (and ^2/**2 variants) -> superscript ².
+    """
+    if text == "":
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        unit = match.group(1)
+        return f"{unit}²"
+
+    return TECH_AREA_UNIT_RE.sub(repl, text)
 
 
 def split_label_value(text: str) -> tuple[str, str]:
@@ -633,6 +654,8 @@ def collect_records_with_mapping(
         for field in TARGET_FIELDS:
             col = mapping.get(field)
             value = row_values[col] if col is not None and col < len(row_values) else ""
+            if field == "technical_data":
+                value = normalize_technical_data_text(value)
             record[field] = value
 
         if strict_components:
@@ -1177,7 +1200,7 @@ def parse_alternative_blocks(candidate: TableCandidate) -> List[Dict[str, object
         for k in technical_keys:
             if k in attrs and attrs[k]:
                 technical_bits.append(f"{k}: {attrs[k]}")
-        technical_data = "\n".join(technical_bits).strip()
+        technical_data = normalize_technical_data_text("\n".join(technical_bits).strip())
 
         all_text = "\n".join([title] + [f"{k}: {v}" for k, v in attrs.items()])
         standard_tokens: List[str] = []
@@ -1264,6 +1287,9 @@ def extract_target_records_from_candidate(
                 "standard": window[4],
                 "marks_of_conformity": window[5],
             }
+            record["technical_data"] = normalize_technical_data_text(
+                normalize_cell(record.get("technical_data", ""))
+            )
             if is_valid_target_record(record):
                 found.append(record)
 
@@ -1538,13 +1564,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Recover common unit superscripts (m2/mm2/cm2/m3 -> m²/mm²/cm²/m³)",
     )
+    parser.add_argument(
+        "--newline-as-space",
+        action="store_true",
+        help="Replace intra-cell newlines with spaces",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    global ENABLE_SUPERSCRIPT_FIX
+    global ENABLE_SUPERSCRIPT_FIX, FLATTEN_CELL_NEWLINES
     args = parse_args()
     ENABLE_SUPERSCRIPT_FIX = args.fix_superscript
+    FLATTEN_CELL_NEWLINES = args.newline_as_space
     if args.target_only:
         target_df: Optional[pd.DataFrame] = None
         try:

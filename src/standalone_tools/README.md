@@ -1,6 +1,6 @@
 # 图片接口调用说明
 
-这份文档说明如何直接调用 `https://right.codes/gpt` 的图片接口。
+这份文档说明如何直接调用 `https://www.right.codes/draw` 的图片接口。
 
 当前项目里已经有独立客户端脚本：
 
@@ -14,7 +14,7 @@
 
 注意：
 
-- 这里是直接请求 `https://right.codes/gpt`
+- 这里是直接请求 `https://www.right.codes/draw`
 - 不需要再启动本地代理服务
 - `API Key` 要使用 `right.codes` 提供的 key，不是 OpenAI 官方 key
 
@@ -31,7 +31,7 @@
 内容示例：
 
 ```env
-IMAGE_API_BASE_URL=https://right.codes/gpt
+IMAGE_API_BASE_URL=https://www.right.codes/draw
 IMAGE_API_KEY=你的RightCode接口Key
 IMAGE_API_MODEL=gpt-image-2
 ```
@@ -71,7 +71,35 @@ python .\src\standalone_tools\image_api_client.py generate --prompt "画一个Sa
 作用：
 
 - 调用 `POST /v1/images/generations`
-- 把返回的 `b64_json` 自动保存为本地图片
+- 把返回的 `b64_json` 或 `url` 自动保存为本地图片
+
+如果接口生成较慢，可以先用较小尺寸测试：
+
+```powershell
+python .\src\standalone_tools\image_api_client.py generate --prompt "画一只猫" --size 1024x1024 --n 1
+```
+
+如果提示词有很多行，先写入文本文件，例如 `prompt.txt`：
+
+```text
+画一张直播间电商海报。
+
+主体：
+一名主播正在介绍 Right Code。
+
+画面要求：
+- 真实摄影风格
+- 柔和布光
+- 不要出现乱码文字
+```
+
+然后用 `--prompt-file` 调用：
+
+```powershell
+python .\src\standalone_tools\image_api_client.py generate --prompt-file .\prompt.txt
+```
+
+注意：`--prompt` 和 `--prompt-file` 二选一即可，不要同时传。
 
 ## 4. 图片编辑
 
@@ -81,10 +109,17 @@ python .\src\standalone_tools\image_api_client.py generate --prompt "画一个Sa
 python .\src\standalone_tools\image_api_client.py edit --prompt "改成水彩画风" --image ".\input.png"
 ```
 
+多行提示词也可以使用：
+
+```powershell
+python .\src\standalone_tools\image_api_client.py edit --prompt-file .\prompt.txt --image ".\input.png"
+```
+
 作用：
 
 - 调用 `POST /v1/images/edits`
 - 上传本地图片并返回编辑后的结果
+- 支持保存接口返回的 `b64_json` 或 `url`
 
 说明：
 
@@ -127,7 +162,7 @@ python .\src\standalone_tools\image_api_client.py generate --prompt "画一只�
 
 ```powershell
 python .\src\standalone_tools\image_api_client.py generate `
-  --base-url "https://right.codes/gpt" `
+  --base-url "https://www.right.codes/draw" `
   --api-key "你的RightCode接口Key" `
   --model "gpt-image-2" `
   --prompt "画一只猫"
@@ -137,7 +172,7 @@ python .\src\standalone_tools\image_api_client.py generate `
 
 ```powershell
 python .\src\standalone_tools\image_api_client.py edit `
-  --base-url "https://right.codes/gpt" `
+  --base-url "https://www.right.codes/draw" `
   --api-key "你的RightCode接口Key" `
   --model "gpt-image-2" `
   --prompt "改成水彩画风" `
@@ -148,7 +183,7 @@ python .\src\standalone_tools\image_api_client.py edit `
 
 ```powershell
 python .\src\standalone_tools\image_api_client.py chat-edit `
-  --base-url "https://right.codes/gpt" `
+  --base-url "https://www.right.codes/draw" `
   --api-key "你的RightCode接口Key" `
   --model "gpt-image-2" `
   --prompt "改成水彩画风" `
@@ -162,7 +197,7 @@ python .\src\standalone_tools\image_api_client.py chat-edit `
 ### 8.1 文生图
 
 ```powershell
-curl -X POST "https://right.codes/gpt/v1/images/generations" `
+curl -X POST "https://www.right.codes/draw/v1/images/generations" `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer 你的RightCode接口Key" `
   -d "{\"model\":\"gpt-image-2\",\"prompt\":\"画一只猫\"}"
@@ -222,10 +257,22 @@ curl -X POST "https://right.codes/gpt/v1/images/generations" `
 - 确认 `.env` 中填写的是：
 
 ```env
-IMAGE_API_BASE_URL=https://right.codes/gpt
+IMAGE_API_BASE_URL=https://www.right.codes/draw
 ```
 
 而不是本机 IP 或其他未启动的地址。
+
+### 9.4 `524`
+
+原因：
+
+- 请求已经到达 `https://www.right.codes/draw`
+- Right Code 后端生成图片耗时过长，入口网关等不到结果后返回超时
+
+解决：
+
+- 先用更短提示词、较小尺寸或 `--n 1` 测试
+- 如果简单请求仍然返回 `524`，通常需要等待服务端恢复或联系 Right Code 服务方
 
 ## 10. 推荐调用顺序
 
