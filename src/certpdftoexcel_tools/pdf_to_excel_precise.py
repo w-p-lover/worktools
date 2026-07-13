@@ -62,6 +62,9 @@ PART_HINT_PATTERN = re.compile(r"(alternative|varistor|object|part)", re.IGNOREC
 UL_FILE_PATTERN = re.compile(r"\bE\d{3,}\b", re.IGNORECASE)
 ALT_SECTION_PATTERN = re.compile(r"\balternative\b", re.IGNORECASE)
 TABLE_MARKER_RE = re.compile(r"\btable\s*:", re.IGNORECASE)
+PDF_SYMBOL_CHAR_TRANSLATION = str.maketrans({
+    "\uf06d": "µ",  # Symbol-font mu often appears as a private-use glyph.
+})
 
 TARGET_FIELDS = [
     "object_part_no",
@@ -166,7 +169,8 @@ def normalize_cell(value: object) -> str:
     except Exception:
         # Some objects don't play well with pd.isna (e.g., lists); fall back.
         return ""
-    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = str(value).translate(PDF_SYMBOL_CHAR_TRANSLATION)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     # Normalize extra spaces in each line.
     lines = [MULTISPACE_RE.sub(" ", line).strip() for line in text.split("\n")]
     if FLATTEN_CELL_NEWLINES:
