@@ -37,6 +37,8 @@ from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
+from cdf_template_adapters import extract_known_template_records
+
 try:
     import camelot
 except Exception as exc:  # pragma: no cover
@@ -62,6 +64,7 @@ PART_HINT_PATTERN = re.compile(r"(alternative|varistor|object|part)", re.IGNOREC
 UL_FILE_PATTERN = re.compile(r"\bE\d{3,}\b", re.IGNORECASE)
 ALT_SECTION_PATTERN = re.compile(r"\balternative\b", re.IGNORECASE)
 TABLE_MARKER_RE = re.compile(r"\btable\s*:", re.IGNORECASE)
+SECTION_ROW_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 /+\-.,&()]+:\s*$")
 PDF_SYMBOL_CHAR_TRANSLATION = str.maketrans({
     "\uf06d": "µ",  # Symbol-font mu often appears as a private-use glyph.
 })
@@ -79,6 +82,8 @@ TARGET_OUTPUT_COLUMNS = [
     "table_index_on_page",
     "row_index_on_table",
     "engine",
+    "row_type",
+    "section_title",
     "object_part_no",
     "manufacturer_trademark",
     "type_model",
@@ -640,6 +645,24 @@ def is_valid_target_record(record: Dict[str, str]) -> bool:
     return has_standard or has_mark or has_tech
 
 
+def detect_section_row(row_values: List[str]) -> Optional[str]:
+    non_empty = [value.strip() for value in row_values if value.strip()]
+    if len(non_empty) != 1:
+        return None
+
+    title = non_empty[0]
+    title_norm = normalize_for_match(title)
+    if not title_norm:
+        return None
+    if title_norm in ("alternative", "componentsinformation"):
+        return None
+    if "object" in title_norm and "part" in title_norm and ("no" in title_norm or "number" in title_norm):
+        return None
+    if SECTION_ROW_PATTERN.match(title) is None:
+        return None
+    return title
+
+
 def collect_records_with_mapping(
     candidate: TableCandidate,
     mapping: Dict[str, int],
@@ -649,11 +672,34 @@ def collect_records_with_mapping(
     rows: List[Dict[str, object]] = []
     for row_idx in range(start_row, len(candidate.df)):
         row_values = [normalize_cell(v) for v in candidate.df.iloc[row_idx].tolist()]
+        section_title = detect_section_row(row_values)
+        if section_title is not None:
+            rows.append(
+                {
+                    "page": candidate.page,
+                    "table_index_on_page": candidate.index_on_page,
+                    "row_index_on_table": row_idx,
+                    "engine": candidate.engine,
+                    "row_type": "section",
+                    "section_title": section_title,
+                    "object_part_no": section_title,
+                    "manufacturer_trademark": "",
+                    "type_model": "",
+                    "technical_data": "",
+                    "standard": "",
+                    "marks_of_conformity": "",
+                    "_section_row": True,
+                }
+            )
+            continue
+
         record: Dict[str, object] = {
             "page": candidate.page,
             "table_index_on_page": candidate.index_on_page,
             "row_index_on_table": row_idx,
             "engine": candidate.engine,
+            "row_type": "detail",
+            "section_title": "",
         }
         for field in TARGET_FIELDS:
             col = mapping.get(field)
@@ -739,6 +785,9 @@ def postprocess_marked_rows(rows: List[Dict[str, object]], kind: Optional[str] =
     # Final strict filter: must have object + at least one of tech/standard/marks.
     filtered: List[Dict[str, object]] = []
     for row in merged:
+        if row.get("_section_row"):
+            filtered.append(row)
+            continue
         obj = normalize_cell(row.get("object_part_no", ""))
         tech = normalize_cell(row.get("technical_data", ""))
         std = normalize_cell(row.get("standard", ""))
@@ -1302,7 +1351,7 @@ def extract_target_records_from_candidate(
 
 def deduplicate_target_records(records: List[Dict[str, object]]) -> List[Dict[str, object]]:
     deduped: List[Dict[str, object]] = []
-    seen: set[tuple[str, str, str, str, str, str]] = set()
+    seen: set[tuple[object, ...]] = set()
 
     sorted_records = sorted(
         records,
@@ -1313,10 +1362,19 @@ def deduplicate_target_records(records: List[Dict[str, object]]) -> List[Dict[st
         ),
     )
     for row in sorted_records:
-        key = tuple(
-            normalize_cell(row.get(field, "")).lower()  # type: ignore[arg-type]
-            for field in TARGET_FIELDS
-        )
+        if row.get("row_type") == "section":
+            key = (
+                "section",
+                int(row.get("page", 0)),
+                int(row.get("table_index_on_page", 0)),
+                int(row.get("row_index_on_table", 0)),
+                normalize_cell(row.get("section_title", "")).lower(),
+            )
+        else:
+            key = tuple(
+                normalize_cell(row.get(field, "")).lower()  # type: ignore[arg-type]
+                for field in TARGET_FIELDS
+            )
         if key in seen:
             continue
         seen.add(key)
@@ -1375,6 +1433,16 @@ def extract_target_records(
 
     if target_policy not in ("focused", "broad"):
         raise ValueError("target_policy must be 'focused' or 'broad'")
+
+    known_template_records = extract_known_template_records(
+        selected,
+        normalize_cell=normalize_cell,
+        normalize_technical_data=normalize_technical_data_text,
+    )
+    if known_template_records is not None:
+        if dedup:
+            known_template_records = deduplicate_target_records(known_template_records)
+        return pd.DataFrame(known_template_records, columns=TARGET_OUTPUT_COLUMNS)
 
     if target_policy == "focused":
         # Phase 1: if the PDF explicitly labels the target table, follow that table first.
