@@ -65,8 +65,10 @@ UL_FILE_PATTERN = re.compile(r"\bE\d{3,}\b", re.IGNORECASE)
 ALT_SECTION_PATTERN = re.compile(r"\balternative\b", re.IGNORECASE)
 TABLE_MARKER_RE = re.compile(r"\btable\s*:", re.IGNORECASE)
 SECTION_ROW_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 /+\-.,&()]+:\s*$")
+SECTION_RELATION_MODEL_PATTERN = re.compile(r"\bW(?:19|27)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b", re.IGNORECASE)
 PDF_SYMBOL_CHAR_TRANSLATION = str.maketrans({
     "\uf06d": "µ",  # Symbol-font mu often appears as a private-use glyph.
+    "\uf0b0": "°",  # Symbol-font degree sign used by values such as 200 °C.
 })
 
 TARGET_FIELDS = [
@@ -84,6 +86,7 @@ TARGET_OUTPUT_COLUMNS = [
     "engine",
     "row_type",
     "section_title",
+    "product_model",
     "object_part_no",
     "manufacturer_trademark",
     "type_model",
@@ -129,7 +132,9 @@ STRICT_HEADER_FIELD_ORDER = [
 MARKED_TABLE_PATTERNS: Dict[str, List[str]] = {
     "components_information": [
         "tablecomponentsinformation",
+        "tablecriticalcomponentsinformation",
         "componentsinformation",
+        "criticalcomponentsinformation",
     ],
     "list_of_compressor": [
         "tablelistofcompressor",
@@ -584,6 +589,12 @@ def detect_components_header_template_mapping(df: pd.DataFrame) -> Optional[tupl
     return best
 
 
+def detect_best_components_header_mapping(df: pd.DataFrame) -> Optional[tuple[int, Dict[str, int]]]:
+    # Prefer the stricter ordered detector: it correctly skips split header
+    # continuation rows such as "No." / "conformity1)".
+    return detect_components_header_template_mapping(df) or detect_components_header_mapping(df)
+
+
 def candidate_normalized_text(candidate: TableCandidate) -> str:
     values = [normalize_cell(v) for v in candidate.df.to_numpy().flatten().tolist()]
     return normalize_for_match(" ".join(values))
@@ -658,7 +669,7 @@ def detect_section_row(row_values: List[str]) -> Optional[str]:
         return None
     if "object" in title_norm and "part" in title_norm and ("no" in title_norm or "number" in title_norm):
         return None
-    if SECTION_ROW_PATTERN.match(title) is None:
+    if SECTION_ROW_PATTERN.match(title) is None and SECTION_RELATION_MODEL_PATTERN.search(title) is None:
         return None
     return title
 
@@ -710,17 +721,23 @@ def collect_records_with_mapping(
 
         if strict_components:
             obj = str(record.get("object_part_no", "")).strip().lower()
+            obj_norm = normalize_for_match(obj)
             mfg = str(record.get("manufacturer_trademark", "")).strip()
             typ = str(record.get("type_model", "")).strip()
             tech = str(record.get("technical_data", "")).strip()
             std = str(record.get("standard", "")).strip()
             mark = str(record.get("marks_of_conformity", "")).strip()
+            mark_norm = normalize_for_match(mark)
 
             if obj.startswith("remark"):
                 continue
-            if "table: components information" in obj:
+            if "table:" in obj and "components information" in obj:
                 continue
             if "object" in obj and "part" in obj and ("no" in obj or "number" in obj):
+                continue
+            if obj_norm in ("no", "number") and (
+                "conformity" in mark_norm or (not mfg and not typ and not tech and not std)
+            ):
                 continue
             rows.append(record)
         else:
@@ -905,23 +922,22 @@ def extract_marked_table_records(selected: List[TableCandidate]) -> List[Dict[st
         best_start: Optional[TableCandidate] = None
         best_mapping: Optional[Dict[str, int]] = None
         best_start_row = 0
-        best_score = -1e9
         best_rows: List[Dict[str, object]] = []
 
         for candidate in candidates:
             if detect_marked_table_kind(candidate) != kind:
                 continue
-            header = detect_components_header_mapping(candidate.df)
+            header = detect_best_components_header_mapping(candidate.df)
             if header is None:
                 continue
             start_row, mapping = header
-            score, rows = score_marked_table_candidate(candidate, mapping, start_row=start_row, kind_override=kind)
-            if rows and score > best_score:
-                best_score = score
+            _, rows = score_marked_table_candidate(candidate, mapping, start_row=start_row, kind_override=kind)
+            if rows:
                 best_start = candidate
                 best_mapping = mapping
                 best_start_row = start_row
                 best_rows = rows
+                break
 
         if best_start is None or best_mapping is None or not best_rows:
             continue
@@ -956,7 +972,7 @@ def extract_marked_table_records(selected: List[TableCandidate]) -> List[Dict[st
             for candidate in page_candidates:
                 # If this page repeats the same marker, allow resetting mapping.
                 c_kind = detect_marked_table_kind(candidate)
-                header = detect_components_header_mapping(candidate.df)
+                header = detect_best_components_header_mapping(candidate.df)
                 if c_kind == kind and header is not None:
                     start_row, mapping = header
                     score, rows = score_marked_table_candidate(candidate, mapping, start_row=start_row, kind_override=kind)
@@ -1371,7 +1387,7 @@ def deduplicate_target_records(records: List[Dict[str, object]]) -> List[Dict[st
                 normalize_cell(row.get("section_title", "")).lower(),
             )
         else:
-            key = tuple(
+            key = (normalize_cell(row.get("product_model", "")).lower(),) + tuple(
                 normalize_cell(row.get(field, "")).lower()  # type: ignore[arg-type]
                 for field in TARGET_FIELDS
             )
@@ -1421,6 +1437,7 @@ def extract_target_records(
     min_score: float,
     target_policy: str = "focused",
     dedup: bool = True,
+    template: str = "auto",
 ) -> pd.DataFrame:
     _, selected = select_candidates(
         input_pdf=input_pdf,
@@ -1438,6 +1455,7 @@ def extract_target_records(
         selected,
         normalize_cell=normalize_cell,
         normalize_technical_data=normalize_technical_data_text,
+        template=template,
     )
     if known_template_records is not None:
         if dedup:
@@ -1618,7 +1636,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-only",
         action="store_true",
-        help="Only export the 6 target columns (ignore non-target tables)",
+        help="Only export normalized target records (ignore non-target tables)",
     )
     parser.add_argument(
         "--target-policy",
@@ -1641,6 +1659,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace intra-cell newlines with spaces",
     )
+    parser.add_argument(
+        "--template",
+        default="auto",
+        help="Preferred CDF template; unknown or unsuccessful templates fall back to auto detection",
+    )
     return parser.parse_args()
 
 
@@ -1660,6 +1683,7 @@ def main() -> None:
                 min_score=args.min_score,
                 target_policy=args.target_policy,
                 dedup=not args.no_dedup,
+                template=args.template,
             )
         except RuntimeError as exc:
             # Mixed supplier PDFs may need camelot fallback for key-value alternative blocks.
@@ -1677,6 +1701,7 @@ def main() -> None:
                         min_score=args.min_score,
                         target_policy=args.target_policy,
                         dedup=not args.no_dedup,
+                        template=args.template,
                     )
                 except RuntimeError:
                     print(

@@ -23,8 +23,25 @@ def _header_text(candidate: object) -> str:
 
 
 def _detect_family(candidates: Sequence[object]) -> Optional[str]:
-    for candidate in candidates:
-        header = _header_text(candidate)
+    headers = [_header_text(candidate) for candidate in candidates]
+    combined_header = "|".join(headers)
+    if (
+        "productinformationformodel" in combined_header
+        and "objectpartno" in combined_header
+        and "manufacturertrademark" in combined_header
+        and "marksofconformity" in combined_header
+    ):
+        return "dekra_multi_page_6"
+
+    for header in headers:
+        if (
+            "tablecomponentsonlyusedinthesamples" in header
+            and "objectpartno" in header
+            and "manufacturertrademark" in header
+            and "typemodel" in header
+            and "technicaldata" in header
+        ):
+            return "cvc_components_4"
         if (
             ("componentpartno" in header or "componentspartno" in header)
             and "manufacturerbrand" in header
@@ -43,6 +60,9 @@ def _detect_family(candidates: Sequence[object]) -> Optional[str]:
             "objectpartno" in header
             and "manufacturertrademark" in header
             and "marksofconformity" in header
+            and "項次" in header
+            and "零組件" in header
+            and "取得標誌" in header
         ):
             return "taiwan_etc_6"
     return None
@@ -53,8 +73,9 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _clean(value: object, normalize_cell: NormalizeCell) -> str:
-    text = normalize_cell(value)
-    return "" if _is_placeholder(text) else text
+    # Keep source placeholders such as `--` and `----` in the exported detail
+    # rows. They are values present in the PDF, not missing cells.
+    return normalize_cell(value)
 
 
 def _join_values(*values: str) -> str:
@@ -76,6 +97,7 @@ def _record(
     technical_data: str,
     standard: str,
     marks_of_conformity: str,
+    product_model: str = "",
 ) -> Dict[str, object]:
     return {
         "page": candidate.page,
@@ -84,6 +106,7 @@ def _record(
         "engine": candidate.engine,
         "row_type": "detail",
         "section_title": "",
+        "product_model": product_model,
         "object_part_no": object_part_no,
         "manufacturer_trademark": manufacturer_trademark,
         "type_model": type_model,
@@ -177,18 +200,129 @@ def _extract_korea_ktl(
 
 
 def _find_header_mapping(candidate: object, field_hints: Dict[str, Sequence[str]]) -> Optional[tuple[int, Dict[str, int]]]:
-    scan_rows = min(6, len(candidate.df))
-    for row_idx in range(scan_rows):
+    def build_mapping(row_values: Sequence[object]) -> Dict[str, int]:
         mapping: Dict[str, int] = {}
-        for col_idx, value in enumerate(candidate.df.iloc[row_idx].tolist()):
+        for col_idx, value in enumerate(row_values):
             normalized = _compact(value)
             for field, hints in field_hints.items():
                 if field not in mapping and any(hint in normalized for hint in hints):
                     mapping[field] = col_idx
                     break
+        return mapping
+
+    scan_rows = min(6, len(candidate.df))
+    for row_idx in range(scan_rows):
+        row_values = candidate.df.iloc[row_idx].tolist()
+        mapping = build_mapping(row_values)
         if len(mapping) == len(field_hints):
             return row_idx, mapping
+
+        if row_idx + 1 < scan_rows:
+            next_values = candidate.df.iloc[row_idx + 1].tolist()
+            merged_values = [
+                "\n".join(str(value or "") for value in pair if str(value or "").strip())
+                for pair in zip(row_values, next_values)
+            ]
+            mapping = build_mapping(merged_values)
+            if len(mapping) == len(field_hints):
+                return row_idx + 1, mapping
     return None
+
+
+def _extract_dekra_multi_page(
+    candidates: Sequence[object],
+    normalize_cell: NormalizeCell,
+    normalize_technical_data: NormalizeTechnicalData,
+) -> List[Dict[str, object]]:
+    hints = {
+        "object_part_no": ("objectpartno",),
+        "manufacturer_trademark": ("manufacturertrademark",),
+        "type_model": ("typemodel",),
+        "technical_data": ("technicaldata",),
+        "standard": ("standard",),
+        "marks_of_conformity": ("marksofconformity",),
+    }
+    records: List[Dict[str, object]] = []
+    candidates_by_page: Dict[int, List[object]] = {}
+    for candidate in candidates:
+        candidates_by_page.setdefault(candidate.page, []).append(candidate)
+
+    last_target_page: Optional[int] = None
+    last_product_model = ""
+    for page in sorted(candidates_by_page):
+        page_candidates = sorted(candidates_by_page[page], key=lambda item: item.index_on_page)
+        for candidate in page_candidates:
+            if "productinformationformodel" not in _header_text(candidate):
+                continue
+            scan_rows = min(6, len(candidate.df))
+            for row_idx in range(scan_rows - 1):
+                row_values = candidate.df.iloc[row_idx].tolist()
+                model_col = next(
+                    (col_idx for col_idx, value in enumerate(row_values) if _compact(value) == "model"),
+                    None,
+                )
+                if model_col is None:
+                    continue
+                next_row = candidate.df.iloc[row_idx + 1].tolist()
+                if model_col < len(next_row):
+                    product_model = _clean(next_row[model_col], normalize_cell)
+                    if product_model:
+                        last_product_model = product_model
+                break
+
+        target_candidates: List[tuple[object, int, Dict[str, int]]] = []
+        for candidate in page_candidates:
+            header = _find_header_mapping(candidate, hints)
+            if header is not None:
+                header_row, mapping = header
+                target_candidates.append((candidate, header_row + 1, mapping))
+
+        if not target_candidates and last_target_page == page - 1 and len(page_candidates) == 1:
+            candidate = page_candidates[0]
+            if candidate.df.shape[1] == len(hints):
+                mapping = {field: idx for idx, field in enumerate(hints)}
+                target_candidates.append((candidate, 0, mapping))
+
+        if not target_candidates:
+            continue
+
+        for candidate, start_row, mapping in target_candidates:
+            for row_idx in range(start_row, len(candidate.df)):
+                row = candidate.df.iloc[row_idx].tolist()
+                values = {
+                    field: _clean(row[col_idx], normalize_cell) if col_idx < len(row) else ""
+                    for field, col_idx in mapping.items()
+                }
+                object_part_no = values["object_part_no"]
+                if not object_part_no or object_part_no.lower().startswith("remark"):
+                    continue
+                technical_data = normalize_technical_data(values["technical_data"])
+                if not any(
+                    [
+                        values["manufacturer_trademark"],
+                        values["type_model"],
+                        technical_data,
+                        values["standard"],
+                        values["marks_of_conformity"],
+                    ]
+                ):
+                    continue
+                records.append(
+                    _record(
+                        candidate,
+                        row_idx,
+                        object_part_no,
+                        values["manufacturer_trademark"],
+                        values["type_model"],
+                        technical_data,
+                        values["standard"],
+                        values["marks_of_conformity"],
+                        last_product_model,
+                    )
+                )
+        last_target_page = page
+
+    return records
 
 
 def _extract_taiwan_etc(
@@ -245,6 +379,57 @@ def _extract_taiwan_etc(
                     technical_data,
                     values["standard"],
                     values["marks_of_conformity"],
+                )
+            )
+    return records
+
+
+def _extract_cvc_components(
+    candidates: Sequence[object],
+    normalize_cell: NormalizeCell,
+    normalize_technical_data: NormalizeTechnicalData,
+) -> List[Dict[str, object]]:
+    hints = {
+        "object_part_no": ("objectpartno",),
+        "manufacturer_trademark": ("manufacturertrademark",),
+        "type_model": ("typemodel",),
+        "technical_data": ("technicaldata",),
+    }
+    records: List[Dict[str, object]] = []
+
+    for candidate in candidates:
+        if candidate.df.shape[1] != 4:
+            continue
+        if "tablecomponentsonlyusedinthesamples" not in _header_text(candidate):
+            continue
+        header = _find_header_mapping(candidate, hints)
+        if header is None:
+            continue
+        header_row, mapping = header
+
+        for row_idx in range(header_row + 1, len(candidate.df)):
+            row = candidate.df.iloc[row_idx].tolist()
+            values = {
+                field: _clean(row[col_idx], normalize_cell) if col_idx < len(row) else ""
+                for field, col_idx in mapping.items()
+            }
+            object_part_no = values["object_part_no"]
+            manufacturer = values["manufacturer_trademark"]
+            type_model = values["type_model"]
+            technical_data = normalize_technical_data(values["technical_data"])
+            if not object_part_no or not any([manufacturer, type_model, technical_data]):
+                continue
+
+            records.append(
+                _record(
+                    candidate,
+                    row_idx,
+                    object_part_no,
+                    manufacturer,
+                    type_model,
+                    technical_data,
+                    "",
+                    "",
                 )
             )
     return records
@@ -312,12 +497,38 @@ def extract_known_template_records(
     candidates: Sequence[object],
     normalize_cell: NormalizeCell,
     normalize_technical_data: NormalizeTechnicalData,
+    template: str = "auto",
 ) -> Optional[List[Dict[str, object]]]:
+    extractors = {
+        "cvc_components": _extract_cvc_components,
+        "korea_ktl": _extract_korea_ktl,
+        "taiwan_etc": _extract_taiwan_etc,
+        "taiwan_pmc": _extract_taiwan_pmc,
+        "dekra_product_info": _extract_dekra_multi_page,
+        "cvc_components_4": _extract_cvc_components,
+        "korea_ktl_5": _extract_korea_ktl,
+        "taiwan_etc_6": _extract_taiwan_etc,
+        "taiwan_pmc_extended": _extract_taiwan_pmc,
+        "dekra_multi_page_6": _extract_dekra_multi_page,
+    }
+    canonical_family = {
+        "cvc_components": "cvc_components_4",
+        "korea_ktl": "korea_ktl_5",
+        "taiwan_etc": "taiwan_etc_6",
+        "taiwan_pmc": "taiwan_pmc_extended",
+        "dekra_product_info": "dekra_multi_page_6",
+    }
+    requested = (template or "auto").strip().lower()
     family = _detect_family(candidates)
-    if family == "korea_ktl_5":
-        return _extract_korea_ktl(candidates, normalize_cell, normalize_technical_data)
-    if family == "taiwan_etc_6":
-        return _extract_taiwan_etc(candidates, normalize_cell, normalize_technical_data)
-    if family == "taiwan_pmc_extended":
-        return _extract_taiwan_pmc(candidates, normalize_cell, normalize_technical_data)
+    requested_family = canonical_family.get(requested, requested)
+    if requested in extractors and (family is None or family == requested_family):
+        records = extractors[requested](candidates, normalize_cell, normalize_technical_data)
+        if records:
+            return records
+
+    extractor = extractors.get(family or "")
+    if extractor is not None:
+        records = extractor(candidates, normalize_cell, normalize_technical_data)
+        if records:
+            return records
     return None

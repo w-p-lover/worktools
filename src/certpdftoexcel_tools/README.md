@@ -169,6 +169,69 @@ Get-ChildItem -Path $inDir -Filter *.pdf -File | ForEach-Object {
    3. 包含「Alternative」的行数据
 4. 若结果存在大量无关数据，重新使用聚焦模式运行。
 
+## 递归批量工具（含子文件夹）
+
+当你的 PDF 分布在多层子目录，且希望输出 Excel 放在每个 PDF 的同一路径下，可使用：
+
+`C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\batch_convert_recursive.py`
+
+### 1) 预演测试（不执行转换）
+
+```powershell
+python "C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\batch_convert_recursive.py" `
+  "C:\Users\IT074\Desktop\认证\测试PDF" `
+  --dry-run --limit 20
+```
+
+### 2) 小规模实测（先跑前3个文件）
+
+```powershell
+python "C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\batch_convert_recursive.py" `
+  "C:\Users\IT074\Desktop\认证\测试PDF" `
+  --limit 3 --overwrite `
+  --pages all --engine pdfplumber --target-policy focused --min-score 4 `
+  --no-dedup --newline-as-space
+```
+
+### 3) 全量递归执行
+
+```powershell
+python "C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\batch_convert_recursive.py" `
+  "C:\Users\IT074\Desktop\认证\测试PDF" `
+  --overwrite `
+  --pages all --engine pdfplumber --target-policy focused --min-score 4 `
+  --no-dedup --newline-as-space
+```
+
+默认输出规则：
+
+- `...\A\B\sample.pdf` -> `...\A\B\sample.xlsx`
+- 如需后缀：`--suffix _target` -> `sample_target.xlsx`
+
+## 独立型号提取工具
+
+`cdf_model_extractor.py` 只读取每份 PDF 的前 5 页，从 `Model/Type reference`、
+`本次申请型号`、`Models` 键值行和型号列表表格中提取产品型号。输出中每个型号占一行，
+并保留来源文件、完整路径、页码、匹配规则和原始内容。
+
+单文件：
+
+```powershell
+python "C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\cdf_model_extractor.py" `
+  "C:\path\to\report.pdf"
+```
+
+文件夹批量汇总：
+
+```powershell
+python "C:\Users\IT074\Documents\New project\src\certpdftoexcel_tools\cdf_model_extractor.py" `
+  "C:\path\to\cdf-folder" `
+  --output "C:\path\to\型号提取结果.xlsx"
+```
+
+若 PDF 位于多级子文件夹中，增加 `--recursive`。默认读取前 5 页，可用
+`--max-pages 8` 调整。
+
 ## 文件位置
 
 当前文档路径：
